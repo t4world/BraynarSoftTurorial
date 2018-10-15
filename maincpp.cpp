@@ -15,6 +15,8 @@
 #include <dxgi.h>
 #include <sstream>
 #include <dwrite.h>
+#include "HighResolutionTimer.h"
+#include "DirectXInput.h"
 //Simple Font
 
 LPCTSTR wndClassName = L"FirstWindows";
@@ -47,15 +49,17 @@ struct Vertex
 	Vertex(){
 
 	}
-	Vertex(float x, float y, float z,float u,float v) :pos(x, y, z),uv(u,v){}
+	Vertex(float x, float y, float z,float u,float v,float nx,float ny,float nz) :pos(x, y, z),uv(u,v),normal(nx,ny,nz){}
 	XMFLOAT3 pos;
 	XMFLOAT2 uv;
+	XMFLOAT3 normal;
 };
 
 D3D11_INPUT_ELEMENT_DESC m_gLayout[] = {
 	{ "POSITION",0,DXGI_FORMAT_R32G32B32_FLOAT,0,0,D3D11_INPUT_PER_VERTEX_DATA, 0},
 	//{ "COLOR",0,DXGI_FORMAT_R32G32B32A32_FLOAT,0,12,D3D11_INPUT_PER_VERTEX_DATA,0},
-	{"TEXCOORD",0,DXGI_FORMAT_R32G32_FLOAT,0,12,D3D11_INPUT_PER_VERTEX_DATA,0}
+	{"TEXCOORD",0,DXGI_FORMAT_R32G32_FLOAT,0,12,D3D11_INPUT_PER_VERTEX_DATA,0},
+	{"NORMAL",0,DXGI_FORMAT_R32G32B32_FLOAT,0,20,D3D11_INPUT_PER_VERTEX_DATA,0}
 };
 
 ID3D11Buffer *g_vertexBuffer;
@@ -75,6 +79,7 @@ ID3D11SamplerState *g_cubeTextureSimpleState;
 
 struct CBuffer {
 	XMMATRIX wvp;
+	XMMATRIX world;
 };
 XMMATRIX viewMatrix;
 XMMATRIX projectMatrix;
@@ -110,19 +115,51 @@ ID3D11ShaderResourceView *m_d2dTexture;
 IDWriteFactory *m_DWriteFactory;
 IDWriteTextFormat *m_TextFormat;
 std::wstring m_printText;
+ID3D11PixelShader* D2D_PS;
+ID3D10Blob* D2D_PS_Buffer;
+
 //SimpleFont
+
+//Timer
+HighResolutionTimer m_hightTimer;
+int frameCount = 0;
+double frameTime = 0;
+int fps;
+
+//lighting
+struct Light
+{
+	Light() {
+		ZeroMemory(this, sizeof(Light));
+	}
+	XMFLOAT3 dir;
+	float pad;
+	XMFLOAT4 ambient;
+	XMFLOAT4 diffuse;
+};
+
+struct  cbPerFrame
+{
+	Light light;
+};
+Light m_light;
+cbPerFrame m_constantBuffPerFrame;
+ID3D11Buffer *m_constantBuffer;
+
+//Input
+DirectXInput m_DirctxInput;
 
 
 bool InitDirect3d11App(HINSTANCE hInstance);
 void ReleaseObject();
 bool InitScene();
-void UpdateScene();
+void UpdateScene(double frameTime);
 void DrawScene();
 
 //SimpleFont;
 bool InitD2D_D3D101_DWrite(IDXGIAdapter1 *adapter);
 void InitD2DScreenTexture();
-void RenderText(std::wstring text);
+void RenderText(std::wstring text,int fps);
 //SimpleFont
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPreInstance, LPSTR lpCmdLine, int nShonwCmd)
@@ -140,6 +177,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPreInstance, LPSTR lpCmdLine,
 	if (!InitScene())
 	{
 		MessageBox(0, L"Init Scene Failed", L"Error", MB_OK);
+		return false;
+	}
+
+	if (!m_DirctxInput.InitDirectInput(hInstance, hwnd))
+	{
+		MessageBox(0, L"Direct input initialization failed", L"Error", MB_OK);
 		return false;
 	}
 	messageLoop();
@@ -197,7 +240,16 @@ bool messageLoop()
 		}
 		else
 		{
-			UpdateScene();
+			frameCount++;
+			if (m_hightTimer.GetTime() > 1.0f)
+			{
+				fps = frameCount;
+				frameCount = 0;
+				m_hightTimer.StartTime();
+			}
+			frameTime = m_hightTimer.GetFrameTime();
+			m_DirctxInput.DetectInput(frameTime,hwnd);
+			UpdateScene(frameTime);
 			DrawScene();
 		}
 	}
@@ -356,6 +408,7 @@ void ReleaseObject()
 	m_d2dTexture->Release();
 	m_DWriteFactory->Release();
 	m_TextFormat->Release();
+	m_DirctxInput.Release();
 }
 
 bool InitScene()
@@ -376,45 +429,53 @@ bool InitScene()
 		return false;
 	}
 	hr = d3d11Device->CreatePixelShader(g_pxBuffer->GetBufferPointer(), g_pxBuffer->GetBufferSize(), NULL, &g_pixelShader);
+
+	hr = D3DX11CompileFromFile(L"Effects.fx", 0, 0, "D2D_PS", "ps_5_0", 0, 0, 0, &D2D_PS_Buffer, 0, 0);
+	if (FAILED(hr))
+	{
+		MessageBox(0, L"Effects.fx ps shader compiler Error!", L"Error", MB_OK);
+		return false;
+	}
+	hr = d3d11Device->CreatePixelShader(D2D_PS_Buffer->GetBufferPointer(), D2D_PS_Buffer->GetBufferSize(), NULL, &D2D_PS);
 	d3d11DevicContext->VSSetShader(g_vertexShader, NULL, 0);
 	d3d11DevicContext->PSSetShader(g_pixelShader, NULL, 0);
 
 	Vertex vertices[] = {
 		// Front Face
-		Vertex(-1.0f, -1.0f, -1.0f, 0.0f, 1.0f),
-		Vertex(-1.0f,  1.0f, -1.0f, 0.0f, 0.0f),
-		Vertex(1.0f,  1.0f, -1.0f, 1.0f, 0.0f),
-		Vertex(1.0f, -1.0f, -1.0f, 1.0f, 1.0f),
+		Vertex(-1.0f, -1.0f, -1.0f, 0.0f, 1.0f,-1.0f, -1.0f, -1.0f),
+		Vertex(-1.0f,  1.0f, -1.0f, 0.0f, 0.0f,-1.0f,  1.0f, -1.0f),
+		Vertex(1.0f,  1.0f, -1.0f, 1.0f, 0.0f, 1.0f,  1.0f, -1.0f),
+		Vertex(1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f),
 
 		// Back Face
-		Vertex(-1.0f, -1.0f, 1.0f, 1.0f, 1.0f),
-		Vertex(1.0f, -1.0f, 1.0f, 0.0f, 1.0f),
-		Vertex(1.0f,  1.0f, 1.0f, 0.0f, 0.0f),
-		Vertex(-1.0f,  1.0f, 1.0f, 1.0f, 0.0f),
+		Vertex(-1.0f, -1.0f, 1.0f, 1.0f, 1.0f,-1.0f, -1.0f, 1.0f),
+		Vertex(1.0f, -1.0f, 1.0f, 0.0f, 1.0f, 1.0f, -1.0f, 1.0f),
+		Vertex(1.0f,  1.0f, 1.0f, 0.0f, 0.0f, 1.0f,  1.0f, 1.0f),
+		Vertex(-1.0f,  1.0f, 1.0f, 1.0f, 0.0f,-1.0f,  1.0f, 1.0f),
 
 		// Top Face
-		Vertex(-1.0f, 1.0f, -1.0f, 0.0f, 1.0f),
-		Vertex(-1.0f, 1.0f,  1.0f, 0.0f, 0.0f),
-		Vertex(1.0f, 1.0f,  1.0f, 1.0f, 0.0f),
-		Vertex(1.0f, 1.0f, -1.0f, 1.0f, 1.0f),
+		Vertex(-1.0f, 1.0f, -1.0f, 0.0f, 1.0f,-1.0f, 1.0f, -1.0f),
+		Vertex(-1.0f, 1.0f,  1.0f, 0.0f, 0.0f,-1.0f, 1.0f,  1.0f),
+		Vertex(1.0f, 1.0f,  1.0f, 1.0f, 0.0f, 1.0f, 1.0f,  1.0f),
+		Vertex(1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f),
 
 		// Bottom Face
-		Vertex(-1.0f, -1.0f, -1.0f, 1.0f, 1.0f),
-		Vertex(1.0f, -1.0f, -1.0f, 0.0f, 1.0f),
-		Vertex(1.0f, -1.0f,  1.0f, 0.0f, 0.0f),
-		Vertex(-1.0f, -1.0f,  1.0f, 1.0f, 0.0f),
+		Vertex(-1.0f, -1.0f, -1.0f, 1.0f, 1.0f,-1.0f, -1.0f, -1.0f),
+		Vertex(1.0f, -1.0f, -1.0f, 0.0f, 1.0f, 1.0f, -1.0f, -1.0f),
+		Vertex(1.0f, -1.0f,  1.0f, 0.0f, 0.0f, 1.0f, -1.0f,  1.0f),
+		Vertex(-1.0f, -1.0f,  1.0f, 1.0f, 0.0f,-1.0f, -1.0f,  1.0f),
 
 		// Left Face
-		Vertex(-1.0f, -1.0f,  1.0f, 0.0f, 1.0f),
-		Vertex(-1.0f,  1.0f,  1.0f, 0.0f, 0.0f),
-		Vertex(-1.0f,  1.0f, -1.0f, 1.0f, 0.0f),
-		Vertex(-1.0f, -1.0f, -1.0f, 1.0f, 1.0f),
+		Vertex(-1.0f, -1.0f,  1.0f, 0.0f, 1.0f,-1.0f, -1.0f,  1.0f),
+		Vertex(-1.0f,  1.0f,  1.0f, 0.0f, 0.0f,-1.0f,  1.0f,  1.0f),
+		Vertex(-1.0f,  1.0f, -1.0f, 1.0f, 0.0f,-1.0f,  1.0f, -1.0f),
+		Vertex(-1.0f, -1.0f, -1.0f, 1.0f, 1.0f,-1.0f, -1.0f, -1.0f),
 
 		// Right Face
-		Vertex(1.0f, -1.0f, -1.0f, 0.0f, 1.0f),
-		Vertex(1.0f,  1.0f, -1.0f, 0.0f, 0.0f),
-		Vertex(1.0f,  1.0f,  1.0f, 1.0f, 0.0f),
-		Vertex(1.0f, -1.0f,  1.0f, 1.0f, 1.0f),
+		Vertex(1.0f, -1.0f, -1.0f, 0.0f, 1.0f, 1.0f, -1.0f, -1.0f),
+		Vertex(1.0f,  1.0f, -1.0f, 0.0f, 0.0f, 1.0f,  1.0f, -1.0f),
+		Vertex(1.0f,  1.0f,  1.0f, 1.0f, 0.0f, 1.0f,  1.0f,  1.0f),
+		Vertex(1.0f, -1.0f,  1.0f, 1.0f, 1.0f, 1.0f, -1.0f,  1.0f),
 	};
 
 	DWORD indexArr[] = {
@@ -505,6 +566,18 @@ bool InitScene()
 	bufferDesc.CPUAccessFlags = 0;
 	bufferDesc.MiscFlags = 0;
 	hr = d3d11Device->CreateBuffer(&bufferDesc, NULL, &g_constantBuffer);
+
+	ZeroMemory(&bufferDesc, sizeof(bufferDesc));
+	bufferDesc.Usage = D3D11_USAGE_DEFAULT;
+	bufferDesc.ByteWidth = sizeof(cbPerFrame);
+	bufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	bufferDesc.CPUAccessFlags = 0;
+	bufferDesc.MiscFlags = 0;
+	hr = d3d11Device->CreateBuffer(&bufferDesc, NULL, &m_constantBuffer);
+
+	m_light.dir = XMFLOAT3(0.25f, 0.5f, -1.0f);
+	m_light.ambient = XMFLOAT4(0.5f, 0.5f, 0.2f, 1.0f);
+	m_light.diffuse = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
 	eyePos = XMVectorSet(0.0f, 3.0f, -8.0f, 0.0);
 	XMVECTOR lookAt = XMVectorSet(0.0f, 0.0f, 0.0f, 0.0f);
 	XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
@@ -521,8 +594,8 @@ bool InitScene()
 	raDesc.CullMode = D3D11_CULL_BACK;
 	hr = d3d11Device->CreateRasterizerState(&raDesc, &g_normalFrame);
 
-	//hr = D3DX11CreateShaderResourceViewFromFile(d3d11Device, L"braynzar.jpg", NULL, NULL, &g_cubeTexture, NULL);
-	hr = D3DX11CreateShaderResourceViewFromFile(d3d11Device, L"Cage.png", NULL, NULL, &g_cubeTexture, NULL);
+	hr = D3DX11CreateShaderResourceViewFromFile(d3d11Device, L"braynzar.jpg", NULL, NULL, &g_cubeTexture, NULL);
+	//hr = D3DX11CreateShaderResourceViewFromFile(d3d11Device, L"Cage.png", NULL, NULL, &g_cubeTexture, NULL);
 
 	D3D11_SAMPLER_DESC sampleDesc;
 	ZeroMemory(&sampleDesc, sizeof(D3D11_SAMPLER_DESC));
@@ -540,6 +613,7 @@ bool InitScene()
 	sampleDesc.BorderColor[3] = 1.0f;
 
 	hr = d3d11Device->CreateSamplerState(&sampleDesc, &g_cubeTextureSimpleState);
+	
 	D3D11_BLEND_DESC blendDesc;
 	ZeroMemory(&blendDesc, sizeof(D3D11_BLEND_DESC));
 	D3D11_RENDER_TARGET_BLEND_DESC targetDesc;
@@ -555,7 +629,7 @@ bool InitScene()
 	blendDesc.AlphaToCoverageEnable = FALSE;
 	blendDesc.RenderTarget[0] = targetDesc;
 	d3d11Device->CreateBlendState(&blendDesc, &g_Transparency);
-
+	
 	D3D11_RASTERIZER_DESC rsDesc;
 	ZeroMemory(&rsDesc, sizeof(D3D11_RASTERIZER_DESC));
 	rsDesc.FillMode = D3D11_FILL_SOLID;
@@ -573,7 +647,7 @@ bool InitScene()
 	return true;
 }
 
-void UpdateScene()
+void UpdateScene(double frameTime)
 {
 	//Update the colors of our scene
 	red += colormodr * 0.00005f;
@@ -586,11 +660,14 @@ void UpdateScene()
 		colormodg *= -1;
 	if (blue >= 1.0f || blue <= 0.0f)
 		colormodb *= -1;
-
-	rotate += 0.00005;
+	red = 0.0f;
+	green = 0.0f;
+	blue = 0.0f;
+	rotate += 1.f * frameTime;
 	if (rotate > 6.24f)
 	{
-		rotate -= 6.24f;
+		//rotate -= 6.24f;
+		rotate = 0.0f;
 	}
 	if (rotate > 3.14f)
 	{
@@ -601,14 +678,14 @@ void UpdateScene()
 		//d3d11DevicContext->RSSetState(g_normalFrame);
 	}
 	cube1World = XMMatrixIdentity();
-	XMVECTOR rotateAxis = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-	cubeRotation = XMMatrixRotationAxis(rotateAxis, rotate);
+	XMVECTOR rotateYAxis = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+	cubeRotation = XMMatrixRotationAxis(rotateYAxis, rotate);
 	cubeTranslate = XMMatrixTranslation(0.0f, 0.0f, 4.0f);
-	cube1World = cubeTranslate * cubeRotation;
+	cube1World = cubeTranslate * cubeRotation * m_DirctxInput.RotationX() * m_DirctxInput.RotationZ();
 
 	cube2World = XMMatrixIdentity();
-	cubeRotation = XMMatrixRotationAxis(rotateAxis, -rotate);
-	cubeScale = XMMatrixScaling(1.3f, 1.3f, 1.3f);
+	cubeRotation = XMMatrixRotationAxis(rotateYAxis, -rotate);
+	cubeScale = XMMatrixScaling(m_DirctxInput.GetScaleX(), m_DirctxInput.GetScaleY(), 1.3f);
 	cube2World = cubeRotation * cubeScale;
 
 
@@ -625,6 +702,9 @@ void DrawScene()
 	//d3d11DevicContext->OMSetBlendState(0, 0, 0xFFFFFFFF);
 	//Render the Opaque objects
 	
+	m_constantBuffPerFrame.light = m_light;
+	d3d11DevicContext->UpdateSubresource(m_constantBuffer, 0, NULL, &m_constantBuffPerFrame, 0, 0);
+	d3d11DevicContext->PSSetConstantBuffers(0, 1, &m_constantBuffer);
 
 	//Set the blend state for transparent objects;
 	//d3d11DevicContext->OMSetBlendState(g_Transparency, blendFacor, 0xFFFFFFFF);
@@ -648,7 +728,7 @@ void DrawScene()
 		cube2World = temp;
 	}
 
-	d3d11DevicContext->RSSetState(g_NoCull);
+	//d3d11DevicContext->RSSetState(g_NoCull);
 	//d3d11DevicContext->Draw(3, 0);
 	WVP = cube1World * viewMatrix * projectMatrix;
 	cbBuffer.wvp = XMMatrixTranspose(WVP);
@@ -658,7 +738,7 @@ void DrawScene()
 	d3d11DevicContext->PSSetSamplers(0, 1, &g_cubeTextureSimpleState);
 	//d3d11DevicContext->RSSetState(g_CCWcullMode);
 	//d3d11DevicContext->DrawIndexed(36, 0, 0);
-	//d3d11DevicContext->RSSetState(g_CWcullMode);
+	d3d11DevicContext->RSSetState(g_CWcullMode);
 	d3d11DevicContext->DrawIndexed(36, 0, 0);
 
 	WVP = cube2World * viewMatrix * projectMatrix;
@@ -669,10 +749,10 @@ void DrawScene()
 	d3d11DevicContext->PSSetSamplers(0, 1, &g_cubeTextureSimpleState);
 	//d3d11DevicContext->RSSetState(g_CCWcullMode);
 	//d3d11DevicContext->DrawIndexed(36, 0, 0);
-	//d3d11DevicContext->RSSetState(g_CWcullMode);
+	d3d11DevicContext->RSSetState(g_CWcullMode);
 	d3d11DevicContext->DrawIndexed(36, 0, 0);
 	//
-	RenderText(L"Hello World zyz!");
+	RenderText(L"FPS:",fps);
 	swapChain->Present(0, 0);
 }
 
@@ -731,10 +811,10 @@ void InitD2DScreenTexture()
 {
 	Vertex v[] =
 	{
-		Vertex(-1.0f, -1.0f, -1.0f, 0.0f, 1.0f),
-		Vertex(-1.0f,  1.0f, -1.0f, 0.0f, 0.0f),
-		Vertex(1.0f,  1.0f, -1.0f, 1.0f, 0.0f),
-		Vertex(1.0f, -1.0f, -1.0f, 1.0f, 1.0f),
+		Vertex(-1.0f, -1.0f, -1.0f, 0.0f, 1.0f,0,0,0),
+		Vertex(-1.0f,  1.0f, -1.0f, 0.0f, 0.0f,0,0,0),
+		Vertex(1.0f,  1.0f, -1.0f, 1.0f, 0.0f,0,0,0),
+		Vertex(1.0f, -1.0f, -1.0f, 1.0f, 1.0f,0,0,0),
 	};
 
 	DWORD indices[] = {
@@ -770,14 +850,14 @@ void InitD2DScreenTexture()
 	d3d11Device->CreateShaderResourceView(m_sharedTex11, NULL, &m_d2dTexture);
 }
 
-void RenderText(std::wstring text)
+void RenderText(std::wstring text,int fps)
 {
 	m_keyedMutex11->ReleaseSync(0);
 	m_keyedMutex10->AcquireSync(0, 5);
 	m_d2dRenderTarget->BeginDraw();
 	m_d2dRenderTarget->Clear(D2D1::ColorF(0.5f, 0.0f, 0.0f, 0.0f));
 	std::wostringstream printString;
-	printString << text;
+	printString << text<<fps;
 	m_printText = printString.str();
 	D2D1_COLOR_F fontColor = D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f);
 	m_Brush->SetColor(fontColor);
@@ -787,6 +867,8 @@ void RenderText(std::wstring text)
 	m_keyedMutex10->ReleaseSync(1);
 	m_keyedMutex11->AcquireSync(1, 5);
 	d3d11DevicContext->OMSetBlendState(g_Transparency, NULL, 0xffffffff);
+
+	d3d11DevicContext->PSSetShader(D2D_PS, 0, 0);
 	//set the d2d index buffer;
 	d3d11DevicContext->IASetIndexBuffer(m_d2dIndexBuffer, DXGI_FORMAT_R32_UINT, 0);
 	UINT stride = sizeof(Vertex);
@@ -794,6 +876,7 @@ void RenderText(std::wstring text)
 	d3d11DevicContext->IASetVertexBuffers(0, 1, &m_d2dVertexBuffer, &stride, &offset);
 	WVP = XMMatrixIdentity();
 	cbBuffer.wvp = XMMatrixTranspose(WVP);
+	cbBuffer.world = XMMatrixTranspose(WVP);
 	d3d11DevicContext->UpdateSubresource(g_constantBuffer, 0, NULL, &cbBuffer, 0, 0);
 	d3d11DevicContext->VSSetConstantBuffers(0, 1, &g_constantBuffer);
 	d3d11DevicContext->PSSetShaderResources(0, 1, &m_d2dTexture);
