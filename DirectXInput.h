@@ -1,4 +1,6 @@
 #pragma once
+#ifndef _DIRECTX_INPUT_
+#define _DIRECTX_INPUT_
 
 #pragma comment(lib,"dinput8.lib")
 #pragma comment(lib,"dxguid.lib")
@@ -27,4 +29,5 @@ private:
 	float scaleX = 1.0f;
 	float scaleY = 1.0f;
 };
+#endif // !_DIRECTX_INPUT_
 
